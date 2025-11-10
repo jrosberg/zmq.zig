@@ -7,11 +7,18 @@ echo "Multiple Simultaneous Connections Test"
 echo "========================================"
 echo ""
 
-# Colors
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m' # No Color
+# Colors (enable only when stdout is a TTY)
+if [ -t 1 ]; then
+    GREEN=$'\033[0;32m'
+    YELLOW=$'\033[1;33m'
+    RED=$'\033[0;31m'
+    NC=$'\033[0m' # No Color
+else
+    GREEN=''
+    YELLOW=''
+    RED=''
+    NC=''
+fi
 
 # Cleanup function
 cleanup() {
@@ -164,7 +171,7 @@ echo "----------------------------------------"
 echo "Subscriber #1 Log (all topics - first 10 messages):"
 echo "----------------------------------------"
 grep "Client #1 \[" client1.log | head -n 10
-SUB1_COUNT=$(grep -c "Client #1 \[" client1.log || echo "0")
+SUB1_COUNT=$(grep "Client #1 \[" client1.log | wc -l)
 echo "Total messages received: $SUB1_COUNT"
 echo ""
 
@@ -172,7 +179,7 @@ echo "----------------------------------------"
 echo "Subscriber #2 Log (weather only - first 10 messages):"
 echo "----------------------------------------"
 grep "Client #2 \[" client2.log | head -n 10
-SUB2_COUNT=$(grep -c "Client #2 \[" client2.log || echo "0")
+SUB2_COUNT=$(grep -c "Client #2 \[" client2.log || true)
 echo "Total messages received: $SUB2_COUNT"
 echo ""
 
@@ -180,7 +187,7 @@ echo "----------------------------------------"
 echo "Subscriber #3 Log (news only - first 10 messages):"
 echo "----------------------------------------"
 grep "Client #3 \[" client3.log | head -n 10
-SUB3_COUNT=$(grep -c "Client #3 \[" client3.log || echo "0")
+SUB3_COUNT=$(grep -c "Client #3 \[" client3.log || true)
 echo "Total messages received: $SUB3_COUNT"
 echo ""
 

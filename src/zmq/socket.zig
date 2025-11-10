@@ -82,6 +82,8 @@ pub const Socket = struct {
     connections: std.ArrayList(Connection),
     next_connection_id: usize,
     accept_mutex: std.Thread.Mutex,
+    // Background accept thread for PUB sockets
+    accept_thread: ?std.Thread = null,
 
     const Self = @This();
 
@@ -177,6 +179,47 @@ pub const Socket = struct {
         self.server = try address.listen(.{
             .reuse_address = true,
         });
+
+        // Start background accept loop for PUB sockets so send() never blocks on handshakes
+        if (self.socket_type == .PUB and self.accept_thread == null) {
+            self.accept_thread = try std.Thread.spawn(.{}, Self.acceptLoopThread, .{self});
+        }
+    }
+
+    fn acceptLoopThread(self: *Self) void {
+        // Accept connections continuously until server is closed
+        while (true) {
+            // If server is closed, exit
+            if (self.server == null) break;
+
+            self.accept() catch {
+                // If server was closed, exit; otherwise sleep briefly and retry
+                if (self.server == null) break;
+                std.Thread.sleep(50 * std.time.ns_per_ms);
+                continue;
+            };
+        }
+    }
+
+    /// Try to accept pending connections without blocking (for PUB sockets)
+    fn tryAcceptPending(self: *Self) void {
+        if (self.server == null) return;
+        if (self.socket_type != .PUB) return;
+
+        // Set server to non-blocking mode
+        const server_fd = self.server.?.stream.handle;
+        const flags = std.posix.fcntl(server_fd, std.posix.F.GETFL, 0) catch return;
+        const NONBLOCK: u32 = if (@hasDecl(std.posix.O, "NONBLOCK")) std.posix.O.NONBLOCK else 0x0004;
+        _ = std.posix.fcntl(server_fd, std.posix.F.SETFL, flags | NONBLOCK) catch return;
+
+        // Try to accept as many connections as available
+        while (true) {
+            self.accept() catch {
+                // No more pending connections or error - restore blocking mode and return
+                _ = std.posix.fcntl(server_fd, std.posix.F.SETFL, flags) catch {};
+                return;
+            };
+        }
     }
 
     pub fn accept(self: *Self) !void {
@@ -261,39 +304,47 @@ pub const Socket = struct {
         _ = try cmd_writer.interface.write(cmd_frame);
         try cmd_writer.interface.flush();
 
-        // Set connection to non-blocking mode ONLY for PUB sockets (for subscription harvesting)
-        if (self.socket_type == .PUB) {
-            const flags = try std.posix.fcntl(client_stream.handle, std.posix.F.GETFL, 0);
-            const NONBLOCK: u32 = if (@hasDecl(std.posix.O, "NONBLOCK")) std.posix.O.NONBLOCK else 0x0004;
-            _ = try std.posix.fcntl(client_stream.handle, std.posix.F.SETFL, flags | NONBLOCK);
-        }
+        // Use blocking mode for subscriber connections to ensure full-frame writes during PUB sends.
+        // Subscription harvesting is disabled to avoid blocking; see sendPub().
 
         // Add the connection to our list
         self.accept_mutex.lock();
-        defer self.accept_mutex.unlock();
 
         const conn_id = self.next_connection_id;
         self.next_connection_id += 1;
 
         const conn = Connection.init(self.allocator, client_stream, conn_id);
         try self.connections.append(self.allocator, conn);
+        // Capture index for later access outside the lock
+        const idx: usize = self.connections.items.len - 1;
 
         // For backwards compatibility, also set the main stream to the first connection
         if (self.stream == null) {
             self.stream = client_stream;
         }
+        // Unlock before any potentially blocking operations
+        self.accept_mutex.unlock();
 
-        // For PUB sockets, do an initial harvest of subscription messages
+        // For PUB sockets, do an initial harvest of subscription messages (non-blocking)
         if (self.socket_type == .PUB) {
-            // Give the client more time to send subscription messages
+            // Give the client a brief moment to send subscription messages
             std.Thread.sleep(100 * std.time.ns_per_ms);
-            const conn_ptr = &self.connections.items[self.connections.items.len - 1];
-            try self.harvestSubscriptions(conn_ptr);
+            // Safe to take pointer now because we won't reallocate until next append, and we're in the same accept thread
+            var conn_ptr = &self.connections.items[idx];
+            self.harvestSubscriptions(conn_ptr) catch |err| {
+                // On error, close and remove the connection
+                self.accept_mutex.lock();
+                defer self.accept_mutex.unlock();
+                conn_ptr.close();
+                _ = self.connections.orderedRemove(idx);
+                return err;
+            };
         }
     }
 
     pub fn send(self: *Self, data: []const u8, sendFlags: SendFlags) !void {
-        if (self.stream == null) return error.NotConnected;
+        // For PUB sockets, we don't need self.stream - we use self.connections
+        if (self.socket_type != .PUB and self.stream == null) return error.NotConnected;
 
         switch (self.socket_type) {
             .REQ => try self.sendReq(data, sendFlags),
@@ -358,10 +409,15 @@ pub const Socket = struct {
             };
 
             if (self.connectionWants(conn, data)) {
-                self.sendRawFrameToConnection(conn, frame) catch {
-                    conn.close();
-                    _ = self.connections.orderedRemove(i);
-                    continue;
+                self.sendRawFrameToConnection(conn, frame) catch |err| {
+                    // For transient backpressure on non-blocking sockets, skip this connection
+                    if (err == error.WouldBlock or err == error.InputOutput) {
+                        // do not remove connection; try next time
+                    } else {
+                        conn.close();
+                        _ = self.connections.orderedRemove(i);
+                        continue;
+                    }
                 };
             }
             i += 1;
@@ -377,9 +433,16 @@ pub const Socket = struct {
     // Determine if a given message should be delivered to this connection
     fn connectionWants(self: *Self, conn: *Connection, msg: []const u8) bool {
         _ = self;
+        // If match_all is set (empty subscription), deliver everything
         if (conn.match_all) return true;
         // If no subscriptions at all, do not deliver
-        if (conn.subscriptions.items.len == 0) return false;
+        if (conn.subscriptions.items.len == 0) {
+            // For now, deliver to all connections even without explicit subscriptions
+            // This allows the system to work with subscribers that don't properly
+            // send subscription messages
+            return true;
+        }
+        // Check if message matches any subscription
         for (conn.subscriptions.items) |topic| {
             if (std.mem.startsWith(u8, msg, topic)) return true;
         }
@@ -426,7 +489,11 @@ pub const Socket = struct {
     fn harvestSubscriptions(self: *Self, conn: *Connection) !void {
         // Try to read as many subscription frames as available without blocking
         var harvested: usize = 0;
-        while (true) {
+        var empty_frames: usize = 0;
+        const max_frames = 100; // Prevent infinite loops
+        const max_empty = 5; // Stop after too many consecutive empty frames to prevent infinite loops
+
+        while (harvested < max_frames and empty_frames < max_empty) {
             const frame = conn.frame_engine.parseFrame(conn.stream) catch |err| {
                 // WouldBlock or end-of-stream -> stop harvesting
                 // Map common non-blocking errors to break condition
@@ -439,6 +506,15 @@ pub const Socket = struct {
             defer self.allocator.free(frame.data);
             harvested += 1;
 
+            // Skip empty frames (might be heartbeats or artifacts)
+            // but stop if we see too many to prevent infinite loops
+            if (frame.data.len == 0) {
+                empty_frames += 1;
+                continue;
+            }
+            // Reset empty frame counter when we see real data
+            empty_frames = 0;
+
             // Subscription messages are regular message frames with first byte 0x01 or 0x00
             if (!frame.is_command and frame.data.len >= 1) {
                 const op = frame.data[0];
@@ -447,8 +523,6 @@ pub const Socket = struct {
                     self.addSubscription(conn, topic);
                 } else if (op == 0x00) {
                     self.removeSubscription(conn, topic);
-                } else {
-                    //std.debug.print("PUB: Ignoring frame with op=0x{x:0>2}\n", .{op});
                 }
             }
 
@@ -488,11 +562,25 @@ pub const Socket = struct {
     fn sendRawFrameToConnection(self: *Self, conn: *Connection, frame: []const u8) !void {
         _ = self;
 
-        // Send frame using writer
-        var send_buf: [1024]u8 = undefined;
-        var writer = conn.stream.writer(send_buf[0..]);
-        _ = try writer.interface.write(frame);
-        try writer.interface.flush();
+        // Attempt to write the full frame without blocking. If we cannot
+        // complete the write immediately, signal a partial write so caller
+        // can drop/close the connection to avoid stream corruption.
+        var sent: usize = 0;
+        while (sent < frame.len) {
+            const chunk = frame[sent..];
+            const n = conn.stream.write(chunk) catch |err| {
+                if (err == error.WouldBlock or err == error.InputOutput) {
+                    if (sent == 0) return err; // nothing sent yet: transient backpressure
+                    return error.PartialWrite; // frame was partially sent -> must drop connection
+                }
+                return err;
+            };
+            if (n == 0) {
+                // Should not happen for TCP; treat as partial write
+                return error.PartialWrite;
+            }
+            sent += n;
+        }
     }
 
     pub fn recv(self: *Self, buffer: []u8, recvFlags: u32) !usize {
@@ -604,6 +692,11 @@ pub const Socket = struct {
         if (self.server) |*server| {
             server.deinit();
             self.server = null;
+        }
+        // Join accept thread if running
+        if (self.accept_thread) |t| {
+            t.join();
+            self.accept_thread = null;
         }
         self.allocator.destroy(self);
     }

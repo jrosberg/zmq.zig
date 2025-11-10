@@ -27,36 +27,10 @@ pub fn main() !void {
 
     // Accept multiple subscribers
     std.debug.print("\nWaiting for subscribers to connect...\n", .{});
-    std.debug.print("Press Ctrl+C after all subscribers have connected.\n\n", .{});
+    std.debug.print("(New subscribers can connect at any time)\n\n", .{});
 
-    // Spawn a thread to accept connections in the background
-    const AcceptContext = struct {
-        socket: *zmq.Socket,
-        running: *std.atomic.Value(bool),
-
-        fn run(self: *@This()) void {
-            while (self.running.load(.acquire)) {
-                self.socket.accept() catch |err| {
-                    if (err == error.WouldBlock) {
-                        std.Thread.sleep(100 * std.time.ns_per_ms);
-                        continue;
-                    }
-                    std.debug.print("Accept error: {any}\n", .{err});
-                    std.Thread.sleep(100 * std.time.ns_per_ms);
-                };
-            }
-        }
-    };
-
-    var running = std.atomic.Value(bool).init(true);
-    var accept_ctx = AcceptContext{
-        .socket = sock,
-        .running = &running,
-    };
-
-    const acceptThread = try std.Thread.spawn(.{}, AcceptContext.run, .{&accept_ctx});
-
-    // Wait a bit for subscribers to connect
+    // Socket.bind() already starts an internal accept loop for PUB sockets.
+    // Just wait a bit for initial subscribers.
     std.debug.print("Waiting 3 seconds for initial subscribers...\n", .{});
     std.Thread.sleep(3 * std.time.ns_per_s);
 
@@ -108,8 +82,4 @@ pub fn main() !void {
 
     std.debug.print("\n=== Publishing complete! ===\n", .{});
     std.debug.print("Final subscriber count: {d}\n", .{sock.connectionCount()});
-
-    // Stop the accept thread
-    running.store(false, .release);
-    acceptThread.join();
 }

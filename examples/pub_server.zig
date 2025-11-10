@@ -25,12 +25,9 @@ pub fn main() !void {
     std.debug.print("Binding to tcp://*:5555...\n", .{});
     try sock.bind("tcp://*:5555");
 
-    // Wait for subscriber to connect
-    std.debug.print("Waiting for subscriber to connect...\n", .{});
-    try sock.accept();
-
-    // Give subscriber time to send subscriptions
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    // Give subscribers time to connect and send subscriptions
+    std.debug.print("Waiting for subscribers to connect...\n", .{});
+    std.Thread.sleep(1000 * std.time.ns_per_ms);
 
     std.debug.print("\nPublishing messages...\n\n", .{});
 
@@ -42,7 +39,10 @@ pub fn main() !void {
 
         // Send weather update
         const weather_msg = try std.fmt.bufPrint(&message_buf, "weather Temperature: {d}°C", .{20 + @mod(count, 10)});
-        try sock.send(weather_msg, .{});
+        sock.send(weather_msg, .{}) catch |err| {
+            std.debug.print("Error sending: {}\n", .{err});
+            continue;
+        };
         std.debug.print("[{d}] Published: {s}\n", .{ count * 2, weather_msg });
 
         // Small delay
